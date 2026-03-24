@@ -311,3 +311,175 @@ class TestResultStructure:
                     'planned_iterations', 'duality_gap', 'residual_norm',
                     'mu_history', 'residual_history'}
         assert required.issubset(result.keys())
+
+
+# ---------------------------------------------------------------------------
+# Tests for input handling / robustness
+# ---------------------------------------------------------------------------
+
+class TestInputHandling:
+    def test_list_inputs_accepted(self):
+        # Solver should accept plain Python lists, not just ndarrays
+        Q = [[1.0, 0.0], [0.0, 1.0]]
+        c = [0.0, 0.0]
+        A = [[1.0, 1.0]]
+        b = [1.0]
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+
+    def test_integer_inputs_promoted_to_float(self):
+        Q = np.array([[2, 0], [0, 2]])   # integer dtype
+        c = np.array([0, 0])
+        A = np.array([[1, 1]])
+        b = np.array([1])
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+
+    def test_epsilon_parameter_respected(self):
+        Q = np.eye(2)
+        c = np.zeros(2)
+        A = np.array([[1.0, 1.0]])
+        b = np.array([1.0])
+        # Looser epsilon → fewer planned iterations
+        r_loose = FiniteTimeDDS(epsilon=1e-4).solve(Q, c, A, b)
+        r_tight = FiniteTimeDDS(epsilon=1e-12).solve(Q, c, A, b)
+        assert r_loose['planned_iterations'] < r_tight['planned_iterations']
+
+    def test_single_constraint(self):
+        # 1-variable, 1-constraint: min 0.5*x^2  s.t. x >= 2  →  x* = 2
+        Q = np.array([[1.0]])
+        c = np.array([0.0])
+        A = np.array([[1.0]])
+        b = np.array([2.0])
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+        np.testing.assert_allclose(result['solution'], [2.0], atol=1e-4)
+        assert abs(result['objective'] - 2.0) < 1e-4
+
+    def test_many_constraints(self):
+        # 4-variable box-constrained QP
+        nz = 4
+        Q = np.diag([1.0, 2.0, 3.0, 4.0])
+        c = np.array([-1.0, -1.0, -1.0, -1.0])
+        # z >= 0 (nz constraints) and z <= 2 (-z >= -2, nz constraints)
+        A = np.vstack([np.eye(nz), -np.eye(nz)])
+        b = np.concatenate([np.zeros(nz), -2.0 * np.ones(nz)])
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+        # Unconstrained optimum: Qz* + c = 0 → z*_i = -c_i/Q_ii.
+        # With c_i = -1 for all i: z*_i = 1/Q_ii ∈ [0, 2] → no active bounds
+        z_expected = np.array([1.0, 0.5, 1.0/3.0, 0.25])
+        np.testing.assert_allclose(result['solution'], z_expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Tests for convergence rate (Theorem 3 verification)
+# ---------------------------------------------------------------------------
+
+class TestConvergenceRate:
+    def test_residual_history_length_matches_iterations(self):
+        Q = np.eye(2)
+        c = np.zeros(2)
+        A = np.array([[1.0, 1.0]])
+        b = np.array([1.0])
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert len(result['residual_history']) == result['iterations']
+        assert len(result['mu_history']) == result['iterations']
+
+    def test_residual_history_decreasing(self):
+        Q = np.eye(3)
+        c = np.array([-2.0, -1.0, -3.0])
+        A = np.eye(3)
+        b = np.zeros(3)
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        r = result['residual_history']
+        for i in range(1, len(r)):
+            assert r[i] <= r[i - 1] + 1e-12, f"residual increased at k={i}"
+
+    def test_actual_iterations_match_planned_for_default_init(self):
+        # Because of the fixed initialization (x=e, s=e), the algorithm uses
+        # exactly N steps for non-trivial problems (no early exit).
+        Q = np.eye(3)
+        c = np.array([-1.0, -2.0, -3.0])
+        A = np.eye(3)
+        b = np.zeros(3)
+        eps = 1e-8
+        result = FiniteTimeDDS(epsilon=eps).solve(Q, c, A, b)
+        assert result['iterations'] == result['planned_iterations']
+
+    def test_theorem3_exact_count_feasible(self):
+        # Verify that exactly N iterations are sufficient (feasible problem).
+        nz, nb = 3, 3
+        n = nz + nb
+        eps = 1e-6
+        N_expected = exact_iteration_count(n, eps)
+        Q = np.eye(nz)
+        c = np.array([-1.0, -1.0, -1.0])
+        A = np.eye(nz)
+        b = np.zeros(nz)
+        result = FiniteTimeDDS(epsilon=eps).solve(Q, c, A, b)
+        assert result['planned_iterations'] == N_expected
+        assert result['iterations'] <= N_expected
+
+    def test_theorem3_exact_count_infeasible(self):
+        # Verify that exactly N iterations are sufficient (infeasible problem).
+        Q = np.eye(2)
+        c = np.zeros(2)
+        A = np.array([[1.0, 1.0], [-1.0, 0.0], [0.0, -1.0]])
+        b = np.array([3.0, -1.0, -1.0])
+        n = 2 + 3   # nz + nb
+        eps = 1e-8
+        N_expected = exact_iteration_count(n, eps)
+        result = FiniteTimeDDS(epsilon=eps).solve(Q, c, A, b)
+        assert result['planned_iterations'] == N_expected
+        assert result['iterations'] <= N_expected
+
+
+# ---------------------------------------------------------------------------
+# Regression tests – known QP instances with analytically verified solutions
+# ---------------------------------------------------------------------------
+
+class TestKnownSolutions:
+    def test_equality_constraint_via_two_inequalities(self):
+        # min 0.5*(x1^2 + x2^2)  s.t. x1 + x2 = 1  (encoded as >= and <=)
+        # Optimal: x1* = x2* = 0.5, obj* = 0.25
+        Q = np.eye(2)
+        c = np.zeros(2)
+        A = np.array([
+            [ 1.0,  1.0],   # x1 + x2 >= 1
+            [-1.0, -1.0],   # -(x1+x2) >= -1  →  x1+x2 <= 1
+        ])
+        b = np.array([1.0, -1.0])
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+        np.testing.assert_allclose(result['solution'], [0.5, 0.5], atol=1e-4)
+        assert abs(result['objective'] - 0.25) < 1e-4
+
+    def test_larger_known_optimum(self):
+        # min 0.5*z'diag(w)z  s.t. z >= l  →  z*_i = max(0, l_i)
+        # Choose l = [0.5, 1.0, 0.2, 0.8], w = [2, 1, 3, 4]
+        w = np.array([2.0, 1.0, 3.0, 4.0])
+        l = np.array([0.5, 1.0, 0.2, 0.8])
+        Q = np.diag(w)
+        c = np.zeros(4)
+        A = np.eye(4)
+        b = l
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+        # Unconstrained optimum z*=0 violates z >= l for all positive l,
+        # so active constraints z* = l.
+        np.testing.assert_allclose(result['solution'], l, atol=1e-4)
+        obj_expected = 0.5 * float(l @ (w * l))
+        assert abs(result['objective'] - obj_expected) < 1e-4
+
+    def test_objective_value_is_nonnegative_for_psd_Q_zero_c(self):
+        rng = np.random.default_rng(99)
+        nz = 6
+        Qraw = rng.standard_normal((nz, nz))
+        Q = Qraw @ Qraw.T   # PSD
+        c = np.zeros(nz)
+        A = np.eye(nz)
+        b = np.zeros(nz)
+        result = FiniteTimeDDS().solve(Q, c, A, b)
+        assert result['status'] == 'optimal'
+        assert result['objective'] >= -1e-6  # obj = 0.5*z'Qz >= 0

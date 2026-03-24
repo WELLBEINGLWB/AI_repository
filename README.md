@@ -39,7 +39,7 @@ rather than an upper bound.
 |------|-------------|
 | `finite_time_dds.py` | Core implementation: EIQP solver as a finite-time discrete dynamical system |
 | `examples/finite_time_dds_demo.py` | Demonstrations: feasible QP, infeasible QP, time-varying QP, iteration scaling |
-| `tests/test_finite_time_dds.py` | Unit tests (25 tests) |
+| `tests/test_finite_time_dds.py` | Unit tests (38 tests) |
 | `2026_IEEETAC_EIQP.pdf` | Full paper |
 
 ### Quick start
